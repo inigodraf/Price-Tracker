@@ -71,77 +71,57 @@ export default function SupermarketScanner() {
     return () => stopCamera();
   }, [appState, startCamera, stopCamera, fetchLocation]);
 
-  // Capture and CROP image for better OCR
+ // Capture and scan via Server AI Vision API
   const handleCaptureAndScan = async () => {
     if (!videoRef.current || !canvasRef.current) return;
     setAppState('processing');
+    setOcrProgress(20); // Simulated loading steps for UI responsiveness
     
     const video = videoRef.current;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // CROP LOGIC: Only grab the center 60% of the image where the reticle is
-    const cropWidth = video.videoWidth * 0.8;
-    const cropHeight = video.videoHeight * 0.4;
-    const cropX = (video.videoWidth - cropWidth) / 2;
-    const cropY = (video.videoHeight - cropHeight) / 2;
-
-    canvas.width = cropWidth;
-    canvas.height = cropHeight;
-    
-    // Draw only the cropped area
-    ctx.drawImage(video, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+    // Use full frame or high-accuracy crop bounding grid box area
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     
     canvas.toBlob((blob) => {
       if (blob) {
         setCapturedImageBlob(blob);
         setImagePreviewUrl(URL.createObjectURL(blob));
       }
-    }, 'image/jpeg', 0.9);
+    }, 'image/jpeg', 0.85);
 
-    const imageDataUrl = canvas.toDataURL('image/jpeg');
+    const base64Image = canvas.toDataURL('image/jpeg');
+    setOcrProgress(50);
 
     try {
-      const result = await Tesseract.recognize(
-        imageDataUrl,
-        'eng',
-        {
-          logger: m => {
-            if (m.status === 'recognizing text') setOcrProgress(Math.round(m.progress * 100));
-          }
-        }
-      );
+      const res = await fetch('/api/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: base64Image })
+      });
 
-      const scannedText = result.data.text;
-      console.log("Raw OCR Text:", scannedText); // Check browser console to see what it actually read
-      
-      // Improved Regex: Looks for numbers with decimals, even without currency symbols
-      // Matches: 105.00, ₱105, 1,200.50
-      const priceRegex = /(?:₱|PHP|P)?\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/i; 
-      const priceMatch = scannedText.match(priceRegex);
-      
-      if (priceMatch && priceMatch[1]) {
-        // Clean up common OCR mistakes (like 'S' instead of '5')
-        const cleanedPrice = priceMatch[1].replace(/S/gi, '5').replace(/O/gi, '0');
-        setPrice(cleanedPrice);
+      const data = await res.json();
+      setOcrProgress(100);
+
+      if (data.product_name || data.price) {
+        setProductName(data.product_name || '');
+        setPrice(data.price ? String(data.price) : '');
+      } else {
+        alert("Could not clearly resolve the text fields automatically. Please fill manually.");
       }
-
-      const lines = scannedText.split('\n').filter(line => line.trim().length > 3);
-      if (lines.length > 0) {
-        const nameCandidates = lines.filter(line => !priceRegex.test(line));
-        if (nameCandidates.length > 0) {
-           setProductName(nameCandidates[0].trim());
-        }
-      }
-
+      
       setAppState('teaching');
     } catch (error) {
-      console.error("OCR Error:", error);
-      alert("Failed to read text. Please enter manually.");
+      console.error("Vision routing failure:", error);
+      alert("Error parsing image contents via API node.");
       setAppState('teaching');
     }
   };
+  
 
   const handleSaveToDatabase = async (e: React.FormEvent) => {
     e.preventDefault();
