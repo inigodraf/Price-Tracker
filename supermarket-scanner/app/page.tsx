@@ -1,54 +1,201 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { createClient } from '@supabase/supabase-js';
+import Tesseract from 'tesseract.js';
 
 // Initialize Supabase Client
-// Replace these with your actual keys from your Supabase Dashboard (Project Settings > API)
-const SUPABASE_URL = "https://your-project-id.supabase.co";
-const SUPABASE_ANON_KEY = "your-anon-key";
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://your-project-id.supabase.co";
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "your-anon-key";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 export default function SupermarketScanner() {
-  // Application states: 'scanning' | 'teaching' | 'success'
-  const [appState, setAppState] = useState<'scanning' | 'teaching' | 'success'>('scanning');
+  // Application states
+  const [appState, setAppState] = useState<'scanning' | 'processing' | 'teaching' | 'success'>('scanning');
   const [loading, setLoading] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
   
+  // Hardware refs
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
   // Form States
   const [productName, setProductName] = useState('');
   const [price, setPrice] = useState('');
   const [category, setCategory] = useState('Grocery');
-  const [location, setLocation] = useState('Aisle 4 - Packaged Foods'); // Mocked auto-detected location
+  const [location, setLocation] = useState('Locating...'); 
+  const [capturedImageBlob, setCapturedImageBlob] = useState<Blob | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string>('');
 
-  // Handle Database Submission
+  // Start Camera
+  const startCamera = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' } // Forces the back camera on mobile
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+    } catch (err) {
+      console.error("Error accessing camera:", err);
+      alert("Could not access the camera. Please check your browser permissions.");
+    }
+  }, []);
+
+  // Stop Camera
+  const stopCamera = useCallback(() => {
+    if (videoRef.current && videoRef.current.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+    }
+  }, []);
+
+  // Get Location
+  const fetchLocation = useCallback(() => {
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setLocation(`Lat: ${position.coords.latitude.toFixed(4)}, Lng: ${position.coords.longitude.toFixed(4)}`);
+        },
+        (error) => {
+          console.warn("Location error:", error.message);
+          setLocation("Location access denied");
+        }
+      );
+    }
+  }, []);
+
+  // Initialize on mount
+  useEffect(() => {
+    if (appState === 'scanning') {
+      startCamera();
+      fetchLocation();
+    } else {
+      stopCamera();
+    }
+    return () => stopCamera();
+  }, [appState, startCamera, stopCamera, fetchLocation]);
+
+  // Capture Image & Process OCR
+  const handleCaptureAndScan = async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    setAppState('processing');
+    
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    // Draw current video frame to canvas
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    // Convert to Blob for upload
+    canvas.toBlob((blob) => {
+      if (blob) {
+        setCapturedImageBlob(blob);
+        setImagePreviewUrl(URL.createObjectURL(blob));
+      }
+    }, 'image/jpeg', 0.8);
+
+    const imageDataUrl = canvas.toDataURL('image/jpeg');
+
+    try {
+      // Run Tesseract OCR
+      const result = await Tesseract.recognize(
+        imageDataUrl,
+        'eng',
+        {
+          logger: m => {
+            if (m.status === 'recognizing text') {
+              setOcrProgress(Math.round(m.progress * 100));
+            }
+          }
+        }
+      );
+
+      const scannedText = result.data.text;
+      
+      // Smart parsing based on the image format
+      // Look for a price format: optional ₱/PHP/P, followed by numbers and decimals
+      const priceRegex = /(?:₱|PHP|P)?\s?(\d+\.\d{2})/i; 
+      const priceMatch = scannedText.match(priceRegex);
+      
+      if (priceMatch && priceMatch[1]) {
+        setPrice(priceMatch[1]);
+      }
+
+      // Very basic text cleanup for product name (grab the first long line)
+      const lines = scannedText.split('\n').filter(line => line.trim().length > 5);
+      if (lines.length > 0) {
+        // Exclude the line if it looks like a price or barcode
+        const nameCandidates = lines.filter(line => !priceRegex.test(line) && !/^\d{8,}$/.test(line.replace(/\s/g, '')));
+        if (nameCandidates.length > 0) {
+           setProductName(nameCandidates[0].trim());
+        }
+      }
+
+      setAppState('teaching');
+    } catch (error) {
+      console.error("OCR Error:", error);
+      alert("Failed to read text. Please enter manually.");
+      setAppState('teaching');
+    }
+  };
+
+  // Upload Photo & Save to DB
   const handleSaveToDatabase = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!productName || !price) {
-      alert("Please fill in all fields");
+      alert("Please fill in the product name and price");
       return;
     }
 
     setLoading(true);
 
     try {
-      const { error } = await supabase
+      let imageUrl = null;
+
+      // 1. Upload Image to Supabase Storage
+      if (capturedImageBlob) {
+        const fileName = `scan_${Date.now()}.jpg`;
+        const { data: uploadData, error: uploadError } = await supabase.storage
+          .from('product-images')
+          .upload(fileName, capturedImageBlob, { contentType: 'image/jpeg' });
+
+        if (uploadError) throw uploadError;
+
+        // Get public URL
+        const { data: publicUrlData } = supabase.storage
+          .from('product-images')
+          .getPublicUrl(fileName);
+          
+        imageUrl = publicUrlData.publicUrl;
+      }
+
+      // 2. Upsert Database Record (Overwrites if product_name exists)
+      const { error: dbError } = await supabase
         .from('supermarket_items')
-        .insert([
+        .upsert([
           { 
-            product_name: productName, 
+            product_name: productName, // Must be marked as UNIQUE in Supabase
             price: parseFloat(price), 
             category, 
             location,
-            image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?q=80&w=600&auto=format&fit=crop' // Mocked image
+            image_url: imageUrl
           },
-        ]);
+        ], { onConflict: 'product_name' }); // Specify the column to check for duplicates
 
-      if (error) throw error;
+      if (dbError) throw dbError;
 
       setAppState('success');
-      // Reset form fields
       setProductName('');
       setPrice('');
+      setCapturedImageBlob(null);
+      setImagePreviewUrl('');
     } catch (error: any) {
       alert(`Error saving item: ${error.message}`);
     } finally {
@@ -57,191 +204,170 @@ export default function SupermarketScanner() {
   };
 
   return (
-    <main className="flex justify-center items-center min-h-screen p-4">
-      {/* Mobile Container Mockup */}
-      <div className="w-full max-w-md h-[844px] bg-slate-900 rounded-[40px] shadow-2xl border-8 border-slate-800 relative overflow-hidden flex flex-col justify-between">
-        
-        {/* Status Bar */}
-        <div className="absolute top-0 inset-x-0 h-12 bg-gradient-to-b from-black/50 to-transparent z-30 flex justify-between items-center px-8 text-xs font-semibold tracking-wider">
-          <span>14:22</span>
-          <div className="flex items-center gap-1.5">
-            <i className="fas fa-signal"></i>
-            <i className="fas fa-wifi"></i>
-            <i className="fas fa-battery-full text-lg"></i>
-          </div>
-        </div>
+    // Mobile-first full screen container
+    <main className="flex flex-col h-screen w-full bg-slate-900 text-white overflow-hidden relative">
+      
+      {/* Hidden Canvas for processing the image */}
+      <canvas ref={canvasRef} className="hidden" />
 
-        {/* Dynamic Image / Camera Viewport */}
-        <div 
-          className="relative w-full h-[45%] bg-cover bg-center transition-all duration-500" 
-          style={{ backgroundImage: `url('https://images.unsplash.com/photo-1542838132-92c53300491e?q=80&w=600&auto=format&fit=crop')` }}
-        >
-          <div className="absolute inset-0 bg-black/40"></div>
+      {/* STATE 1: SCANNING MODE */}
+      {appState === 'scanning' && (
+        <div className="relative w-full h-full flex flex-col">
+          {/* Camera Feed */}
+          <video 
+            ref={videoRef} 
+            autoPlay 
+            playsInline 
+            className="absolute inset-0 w-full h-full object-cover"
+          />
+          
+          <div className="absolute inset-0 bg-black/20 z-10"></div>
 
-          {/* Top Actions Context Tags */}
-          <div className="absolute top-14 inset-x-0 flex justify-between px-6 z-20">
-            <button onClick={() => setAppState('scanning')} className="w-10 h-10 rounded-full bg-black/40 backdrop-blur-md flex items-center justify-center border border-white/10 text-white">
-              <i className="fas fa-arrow-left"></i>
-            </button>
-            {appState === 'scanning' ? (
-              <div className="bg-cyan-500/20 backdrop-blur-md px-4 py-1.5 rounded-full border border-cyan-500/50 flex items-center gap-2 text-xs font-medium text-cyan-400">
-                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span> Scanning Inventory
-              </div>
-            ) : (
-              <div className="bg-amber-500/20 backdrop-blur-md px-4 py-1.5 rounded-full border border-amber-500/50 flex items-center gap-2 text-xs font-medium text-amber-400">
-                <i className="fas fa-triangle-exclamation"></i> Unrecognized Item
-              </div>
-            )}
-          </div>
-
-          {/* Reticle / Target Scanner View Overlay */}
-          {appState === 'scanning' && (
-            <div className="absolute inset-0 flex items-center justify-center mt-8">
-              <div className="w-44 h-44 border-2 border-dashed border-cyan-400/60 rounded-3xl relative animate-pulse">
-                <div className="absolute -top-1 -left-1 w-6 h-6 border-t-4 border-l-4 border-cyan-400 rounded-tl-lg"></div>
-                <div className="absolute -top-1 -right-1 w-6 h-6 border-t-4 border-r-4 border-cyan-400 rounded-tr-lg"></div>
-                <div className="absolute -bottom-1 -left-1 w-6 h-6 border-b-4 border-l-4 border-cyan-400 rounded-bl-lg"></div>
-                <div className="absolute -bottom-1 -right-1 w-6 h-6 border-b-4 border-r-4 border-cyan-400 rounded-br-lg"></div>
+          {/* UI Overlay */}
+          <div className="relative z-20 flex flex-col h-full justify-between p-6">
+            <div className="flex justify-between items-center pt-8">
+              <div className="bg-cyan-500/80 backdrop-blur-md px-4 py-1.5 rounded-full border border-cyan-500 flex items-center gap-2 text-xs font-bold text-white shadow-lg">
+                <span className="w-2 h-2 rounded-full bg-white animate-pulse"></span> {location !== 'Locating...' ? 'GPS Active' : 'Locating...'}
               </div>
             </div>
-          )}
-        </div>
 
-        {/* Interactive Dynamic Bottom Sheet Content */}
-        <div className="w-full h-[60%] bg-slate-900 border-t border-white/10 rounded-t-[32px] -mt-6 z-10 px-6 pt-4 pb-8 flex flex-col shadow-[0_-10px_30px_rgba(0,0,0,0.5)] overflow-y-auto">
-          <div className="w-12 h-1 bg-slate-700 rounded-full mx-auto mb-5 shrink-0"></div>
-
-          {/* STATE 1: SCANNING MODE VIEW */}
-          {appState === 'scanning' && (
-            <div className="flex flex-col justify-between h-full">
-              <div className="text-center py-8">
-                <div className="w-16 h-16 bg-cyan-500/10 text-cyan-400 rounded-full flex items-center justify-center text-2xl mx-auto mb-4 animate-bounce">
-                  <i className="fas fa-barcode"></i>
+            {/* Reticle / Target Scanner */}
+            <div className="flex-1 flex items-center justify-center">
+              <div className="w-64 h-32 border-2 border-white/50 rounded-lg relative">
+                <div className="absolute -top-1 -left-1 w-8 h-8 border-t-4 border-l-4 border-cyan-400"></div>
+                <div className="absolute -top-1 -right-1 w-8 h-8 border-t-4 border-r-4 border-cyan-400"></div>
+                <div className="absolute -bottom-1 -left-1 w-8 h-8 border-b-4 border-l-4 border-cyan-400"></div>
+                <div className="absolute -bottom-1 -right-1 w-8 h-8 border-b-4 border-r-4 border-cyan-400"></div>
+                <div className="absolute inset-0 flex items-center justify-center text-white/50 text-xs font-bold uppercase tracking-widest">
+                  Align Price Tag
                 </div>
-                <h3 className="text-lg font-bold text-white">Point camera at item</h3>
-                <p className="text-xs text-slate-400 max-w-xs mx-auto mt-2">
-                  The system automatically identifies supermarket products, registers current store prices, and logs floor location layouts.
-                </p>
               </div>
-              <button 
-                onClick={() => setAppState('teaching')}
-                className="w-full py-4 bg-slate-800 hover:bg-slate-750 transition rounded-xl font-semibold text-sm flex items-center justify-center gap-2 border border-white/5"
-              >
-                <i className="fas fa-plus"></i> Simulate Missing Product
-              </button>
             </div>
-          )}
 
-          {/* STATE 2: TEACHING / ADDING TO SUPABASE FORM */}
-          {appState === 'teaching' && (
-            <form onSubmit={handleSaveToDatabase} className="flex flex-col flex-1 justify-between">
-              <div>
-                <div className="mb-4">
-                  <h2 className="text-lg font-bold text-white">Teach Supermarket Database</h2>
-                  <p className="text-xs text-slate-400 mt-0.5">This item is missing. Enter details to index it.</p>
-                </div>
-
-                <div className="space-y-3">
-                  <div>
-                    <label className="block text-[10px] uppercase font-bold text-slate-500 tracking-wider mb-1 ml-0.5">Product / Item Name</label>
-                    <input 
-                      type="text" 
-                      required
-                      value={productName}
-                      onChange={(e) => setProductName(e.target.value)}
-                      placeholder="e.g., Organic Whole Milk 1L" 
-                      className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-cyan-400 transition"
-                    />
-                  </div>
-
-                  <div className="flex gap-3">
-                    <div className="flex-1">
-                      <label className="block text-[10px] uppercase font-bold text-slate-500 tracking-wider mb-1 ml-0.5">Supermarket Price</label>
-                      <div className="relative">
-                        <span className="absolute left-4 top-3 text-slate-500 text-sm">$</span>
-                        <input 
-                          type="number" 
-                          step="0.01"
-                          required
-                          value={price}
-                          onChange={(e) => setPrice(e.target.value)}
-                          placeholder="0.00" 
-                          className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl pl-8 pr-4 py-3 text-sm focus:outline-none focus:border-cyan-400 transition"
-                        />
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <label className="block text-[10px] uppercase font-bold text-slate-500 tracking-wider mb-1 ml-0.5">Department</label>
-                      <select 
-                        value={category}
-                        onChange={(e) => setCategory(e.target.value)}
-                        className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-3 text-sm focus:outline-none focus:border-cyan-400 transition appearance-none"
-                      >
-                        <option value="Grocery">Grocery</option>
-                        <option value="Dairy & Eggs">Dairy & Eggs</option>
-                        <option value="Produce">Produce</option>
-                        <option value="Meat & Seafood">Meat & Seafood</option>
-                        <option value="Bakery">Bakery</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-3 flex items-center gap-3">
-                    <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center text-emerald-400 shrink-0">
-                      <i className="fas fa-map-location-dot text-sm"></i>
-                    </div>
-                    <div className="truncate">
-                      <p className="text-[9px] uppercase font-bold text-slate-500 tracking-wider">Auto-Sensed GPS Shelf Location</p>
-                      <input 
-                        type="text" 
-                        value={location}
-                        onChange={(e) => setLocation(e.target.value)}
-                        className="bg-transparent font-semibold text-xs text-slate-300 w-full focus:outline-none focus:border-b border-slate-600"
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-
+            <div className="pb-8">
               <button 
-                type="submit" 
-                disabled={loading}
-                className="w-full mt-5 py-3.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:opacity-90 active:scale-[0.98] transition rounded-xl font-semibold text-sm flex items-center justify-center gap-2 text-white shadow-lg shadow-cyan-500/20 disabled:opacity-50"
+                onClick={handleCaptureAndScan}
+                className="w-20 h-20 mx-auto bg-white rounded-full flex items-center justify-center border-4 border-slate-300 shadow-[0_0_20px_rgba(255,255,255,0.4)] active:scale-95 transition"
               >
-                {loading ? (
-                  <>Writing to Database...</>
-                ) : (
-                  <>
-                    <i className="fas fa-brain"></i> Save & Train Machine Learning
-                  </>
-                )}
+                <div className="w-16 h-16 bg-cyan-500 rounded-full"></div>
               </button>
-            </form>
-          )}
+              <p className="text-center text-xs mt-4 font-medium text-white/80">Tap to capture and extract text</p>
+            </div>
+          </div>
+        </div>
+      )}
 
-          {/* STATE 3: SUCCESS MUTATION BANNER */}
-          {appState === 'success' && (
-            <div className="flex flex-col justify-between h-full text-center py-8">
-              <div>
-                <div className="w-16 h-16 bg-emerald-500/10 text-emerald-400 rounded-full flex items-center justify-center text-2xl mx-auto mb-4">
-                  <i className="fas fa-circle-check"></i>
-                </div>
-                <h3 className="text-xl font-bold text-white">Database Synchronized!</h3>
-                <p className="text-xs text-slate-400 max-w-xs mx-auto mt-2">
-                  The item has been committed to Supabase. Future algorithmic image passes will instantly resolve this item.
-                </p>
-              </div>
+      {/* STATE 2: OCR PROCESSING */}
+      {appState === 'processing' && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
+          <div className="w-20 h-20 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin mb-6"></div>
+          <h2 className="text-2xl font-bold mb-2">Analyzing Image...</h2>
+          <p className="text-slate-400">Extracting product name and price tags</p>
+          <div className="w-full max-w-xs bg-slate-800 rounded-full h-2 mt-6">
+            <div className="bg-cyan-500 h-2 rounded-full transition-all duration-300" style={{ width: `${ocrProgress}%` }}></div>
+          </div>
+        </div>
+      )}
+
+      {/* STATE 3: TEACHING / CONFIRMING DATA */}
+      {appState === 'teaching' && (
+        <div className="flex-1 flex flex-col h-full bg-slate-900 overflow-y-auto pb-10">
+          {imagePreviewUrl && (
+            <div className="w-full h-48 bg-slate-800 relative">
+               {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={imagePreviewUrl} alt="Captured tag" className="w-full h-full object-cover opacity-60" />
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-900 to-transparent"></div>
               <button 
                 onClick={() => setAppState('scanning')}
-                className="w-full py-4 bg-gradient-to-r from-slate-800 to-slate-700 hover:opacity-90 transition rounded-xl font-semibold text-sm flex items-center justify-center gap-2 text-white"
+                className="absolute top-6 left-4 w-10 h-10 rounded-full bg-black/50 backdrop-blur-md flex items-center justify-center text-white"
               >
-                Scan Next Item
+                ←
               </button>
             </div>
           )}
 
+          <form onSubmit={handleSaveToDatabase} className="flex flex-col flex-1 px-6 pt-4 space-y-5">
+            <div>
+              <h2 className="text-xl font-bold text-white">Verify Details</h2>
+              <p className="text-xs text-slate-400 mt-1">Review OCR results. Save will update existing items.</p>
+            </div>
+
+            <div>
+              <label className="block text-xs uppercase font-bold text-slate-500 tracking-wider mb-2">Product Name (Unique)</label>
+              <input 
+                type="text" 
+                required
+                value={productName}
+                onChange={(e) => setProductName(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-cyan-400 transition"
+              />
+            </div>
+
+            <div className="flex gap-4">
+              <div className="flex-1">
+                <label className="block text-xs uppercase font-bold text-slate-500 tracking-wider mb-2">Price</label>
+                <div className="relative">
+                  <span className="absolute left-4 top-3 text-slate-500 font-bold">₱</span>
+                  <input 
+                    type="number" 
+                    step="0.01"
+                    required
+                    value={price}
+                    onChange={(e) => setPrice(e.target.value)}
+                    className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl pl-8 pr-4 py-3 focus:outline-none focus:border-cyan-400 transition"
+                  />
+                </div>
+              </div>
+              <div className="flex-1">
+                <label className="block text-xs uppercase font-bold text-slate-500 tracking-wider mb-2">Category</label>
+                <select 
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-3 focus:outline-none focus:border-cyan-400 transition"
+                >
+                  <option value="Grocery">Grocery</option>
+                  <option value="Household">Household</option>
+                  <option value="Produce">Produce</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 flex items-center gap-3">
+              <div className="truncate flex-1">
+                <p className="text-[10px] uppercase font-bold text-cyan-500 tracking-wider mb-1">Detected Location</p>
+                <p className="text-sm font-semibold text-slate-300">{location}</p>
+              </div>
+            </div>
+
+            <button 
+              type="submit" 
+              disabled={loading}
+              className="w-full mt-auto py-4 bg-cyan-600 hover:bg-cyan-500 active:scale-95 transition rounded-xl font-bold text-white shadow-lg shadow-cyan-900 disabled:opacity-50"
+            >
+              {loading ? 'Saving to Database...' : 'Upload & Save Data'}
+            </button>
+          </form>
         </div>
-      </div>
+      )}
+
+      {/* STATE 4: SUCCESS */}
+      {appState === 'success' && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
+          <div className="w-24 h-24 bg-emerald-500/20 text-emerald-400 rounded-full flex items-center justify-center text-4xl mb-6">
+            ✓
+          </div>
+          <h3 className="text-2xl font-bold text-white mb-2">Item Logged!</h3>
+          <p className="text-slate-400 max-w-xs mx-auto mb-10">
+            Database updated successfully with image and location data.
+          </p>
+          <button 
+            onClick={() => setAppState('scanning')}
+            className="w-full max-w-xs py-4 bg-slate-800 hover:bg-slate-700 transition rounded-xl font-bold text-white"
+          >
+            Scan Next Item
+          </button>
+        </div>
+      )}
     </main>
   );
 }
