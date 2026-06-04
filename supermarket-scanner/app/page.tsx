@@ -5,8 +5,8 @@ import { createClient } from '@supabase/supabase-js';
 import Tesseract from 'tesseract.js';
 
 // Initialize Supabase Client
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://mjaeopdoclmwtaswjdvp.supabase.co";
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1qYWVvcGRvY2xtd3Rhc3dqZHZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1NjQ5OTIsImV4cCI6MjA5NjE0MDk5Mn0.PHvm-rgPVMia-tn6ZQI2H8KsY3jroY6aZOyVJqHLK5E";
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 export default function SupermarketScanner() {
@@ -17,26 +17,24 @@ export default function SupermarketScanner() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Form States
   const [productName, setProductName] = useState('');
   const [price, setPrice] = useState('');
   const [category, setCategory] = useState('Grocery');
-  const [location, setLocation] = useState('Locating...'); 
+  const [storeName, setStoreName] = useState('Puregold');
+  
+  // Location & Image States
+  const [latitude, setLatitude] = useState<number | null>(null);
+  const [longitude, setLongitude] = useState<number | null>(null);
   const [capturedImageBlob, setCapturedImageBlob] = useState<Blob | null>(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string>('');
 
-  // Start Camera - Forced to high resolution
   const startCamera = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { 
-          facingMode: 'environment',
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
-        }
+        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
       });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-      }
+      if (videoRef.current) videoRef.current.srcObject = stream;
     } catch (err) {
       console.error("Error accessing camera:", err);
       alert("Could not access the camera. Please check your permissions.");
@@ -54,9 +52,11 @@ export default function SupermarketScanner() {
     if ("geolocation" in navigator) {
       navigator.geolocation.getCurrentPosition(
         (position) => {
-          setLocation(`Lat: ${position.coords.latitude.toFixed(4)}, Lng: ${position.coords.longitude.toFixed(4)}`);
+          setLatitude(position.coords.latitude);
+          setLongitude(position.coords.longitude);
         },
-        () => setLocation("Location access denied")
+        (error) => console.log("Location access failed", error),
+        { enableHighAccuracy: true }
       );
     }
   }, []);
@@ -71,57 +71,136 @@ export default function SupermarketScanner() {
     return () => stopCamera();
   }, [appState, startCamera, stopCamera, fetchLocation]);
 
- // Capture and scan via Server AI Vision API
+  // SMART PARSER: Finds the price near currency symbols and extracts clean names
+  const parseOcrTextSmartly = (rawText: string) => {
+    const lines = rawText.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    console.log("Cleaned Lines for Parsing:", lines);
+
+    let detectedPrice = "";
+    let detectedName = "";
+
+    // 1. SMART PRICE DETECTION (Looks for ₱, P, p, F, or standalone decimals)
+    // Matches patterns like ₱ 105.00, P45.75, or just numbers with decimals omitting barcode noise
+    const priceRegex = /(?:₱|P|p|F|E)?\s*(\d+[\.,]\s*\d{2})/i;
+
+    for (let line of lines) {
+      // Ignore lines that look like barcode strings (lots of vertical lines)
+      if ((line.match(/[|lI1i!]/g) || []).length > 5 && !line.includes('.')) {
+        continue;
+      }
+
+      const match = line.match(priceRegex);
+      if (match) {
+        // Grab the digits, fix common spacing issues caused by OCR
+        detectedPrice = match[1].replace(/\s+/g, '').replace(',', '.');
+        break;
+      }
+    }
+
+    // 2. SMART NAME DETECTION
+    // Find the first line that has real words and does NOT contain the price
+    for (let line of lines) {
+      // Filter out barcodes and prices
+      const hasBarcodeNoise = (line.match(/[|lI]/g) || []).length > 4;
+      const hasPriceDigits = priceRegex.test(line);
+      const isTooShort = line.replace(/[^a-zA-Z]/g, "").length < 3;
+
+      if (!hasBarcodeNoise && !hasPriceDigits && !isTooShort) {
+        // Clean up common header/footer junk characters
+        detectedName = line.replace(/[^a-zA-Z0-9\s\-\.\/]/g, '').trim();
+        break;
+      }
+    }
+
+    return { detectedName, detectedPrice };
+  };
+
+  // Capture, Preprocess Image, and Run Free Tesseract OCR
   const handleCaptureAndScan = async () => {
     if (!videoRef.current || !canvasRef.current) return;
     setAppState('processing');
-    setOcrProgress(20); // Simulated loading steps for UI responsiveness
+    setOcrProgress(5);
     
     const video = videoRef.current;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Use full frame or high-accuracy crop bounding grid box area
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    // --- 1. IMAGE PREPROCESSING & COMPRESSION ---
+    // Target a clean box size for scanning to isolate text from background noise
+    const scanWidth = video.videoWidth * 0.9;
+    const scanHeight = video.videoHeight * 0.5;
+    const sx = (video.videoWidth - scanWidth) / 2;
+    const sy = (video.videoHeight - scanHeight) / 2;
+
+    canvas.width = scanWidth;
+    canvas.height = scanHeight;
     
+    // Draw raw crop onto canvas
+    ctx.drawImage(video, sx, sy, scanWidth, scanHeight, 0, 0, scanWidth, scanHeight);
+
+    // Save optimized preview blob for database upload
     canvas.toBlob((blob) => {
       if (blob) {
         setCapturedImageBlob(blob);
         setImagePreviewUrl(URL.createObjectURL(blob));
       }
-    }, 'image/jpeg', 0.85);
+    }, 'image/jpeg', 0.6); // 60% compression keeps file sizes very tiny
 
-    const base64Image = canvas.toDataURL('image/jpeg');
-    setOcrProgress(50);
+    // --- 2. ADVANCED OCR BINARIZATION FILTER ---
+    // This turns the image into high contrast black & white to fill in the thermal dot-gaps
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imgData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      // Convert to grayscale
+      const grayscale = 0.299 * r + 0.587 * g + 0.114 * b;
+      
+      // Harsh thresholding: if dark, make solid black. If light, make solid white.
+      const threshold = 110; 
+      const finalColor = grayscale < threshold ? 0 : 255;
+      
+      data[i] = finalColor;     // R
+      data[i + 1] = finalColor; // G
+      data[i + 2] = finalColor; // B
+    }
+    ctx.putImageData(imgData, 0, 0);
 
+    const processedImageBase64 = canvas.toDataURL('image/jpeg');
+    setOcrProgress(20);
+
+    // --- 3. FREE LOCAL TESSERACT OCR RUN ---
     try {
-      const res = await fetch('/api/scan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: base64Image })
-      });
+      const result = await Tesseract.recognize(
+        processedImageBase64,
+        'eng',
+        {
+          logger: m => {
+            if (m.status === 'recognizing text') {
+              setOcrProgress(20 + Math.round(m.progress * 80));
+            }
+          }
+        }
+      );
 
-      const data = await res.json();
-      setOcrProgress(100);
+      const rawText = result.data.text;
+      console.log("Raw OCR Extracted Text:\n", rawText);
 
-      if (data.product_name || data.price) {
-        setProductName(data.product_name || '');
-        setPrice(data.price ? String(data.price) : '');
-      } else {
-        alert("Could not clearly resolve the text fields automatically. Please fill manually.");
-      }
+      // Run our smart text filtering logic
+      const { detectedName, detectedPrice } = parseOcrTextSmartly(rawText);
+
+      setProductName(detectedName || '');
+      setPrice(detectedPrice || '');
       
       setAppState('teaching');
     } catch (error) {
-      console.error("Vision routing failure:", error);
-      alert("Error parsing image contents via API node.");
+      console.error("Local OCR Error:", error);
+      alert("Failed to read text locally. Please enter the tag details manually.");
       setAppState('teaching');
     }
   };
-  
 
   const handleSaveToDatabase = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -133,6 +212,8 @@ export default function SupermarketScanner() {
 
     try {
       let imageUrl = null;
+      
+      // Upload compressed image to your validated 'product-images' bucket
       if (capturedImageBlob) {
         const fileName = `scan_${Date.now()}.jpg`;
         const { error: uploadError } = await supabase.storage
@@ -140,18 +221,22 @@ export default function SupermarketScanner() {
           .upload(fileName, capturedImageBlob, { contentType: 'image/jpeg' });
 
         if (uploadError) throw uploadError;
+        
         const { data: publicUrlData } = supabase.storage.from('product-images').getPublicUrl(fileName);
         imageUrl = publicUrlData.publicUrl;
       }
 
+      // Save everything including coordinates into Supabase
       const { error: dbError } = await supabase
         .from('supermarket_items')
         .upsert([
           { 
             product_name: productName, 
             price: parseFloat(price), 
-            category, 
-            location,
+            category: category, 
+            store_name: storeName,
+            latitude: latitude,
+            longitude: longitude,
             image_url: imageUrl
           },
         ], { onConflict: 'product_name' });
@@ -164,7 +249,8 @@ export default function SupermarketScanner() {
       setCapturedImageBlob(null);
       setImagePreviewUrl('');
     } catch (error: any) {
-      alert(`Error saving item: ${error.message}`);
+      console.error(error);
+      alert(`Database Error: ${error.message}`);
     } finally {
       setLoading(false);
     }
@@ -177,27 +263,23 @@ export default function SupermarketScanner() {
       {appState === 'scanning' && (
         <div className="relative w-full h-full flex flex-col">
           <video ref={videoRef} autoPlay playsInline className="absolute inset-0 w-full h-full object-cover" />
-          <div className="absolute inset-0 bg-black/40 z-10"></div>
-
-          <div className="relative z-20 flex flex-col h-full justify-between p-6">
-            <div className="flex justify-center pt-8">
-              <div className="bg-cyan-500/80 backdrop-blur-md px-4 py-1.5 rounded-full border border-cyan-500 flex items-center gap-2 text-xs font-bold shadow-lg">
+          
+          {/* Target Overlay Guidelines */}
+          <div className="absolute inset-0 z-10 flex flex-col justify-between p-6 bg-black/20">
+            <div className="flex flex-col items-center pt-6 gap-3">
+              <div className={`px-4 py-1.5 rounded-full border flex items-center gap-2 text-xs font-bold shadow-lg backdrop-blur-md ${latitude ? 'bg-emerald-600/90 border-emerald-500' : 'bg-amber-600/90 border-amber-500'}`}>
                 <span className="w-2 h-2 rounded-full bg-white animate-pulse"></span> 
-                {location !== 'Locating...' ? 'GPS Active' : 'Locating...'}
+                {latitude ? `GPS Locked: ${latitude.toFixed(4)}, ${longitude?.toFixed(4)}` : 'Fixing GPS Coordinates...'}
               </div>
             </div>
 
-            {/* Clear center area to show the user exactly what is being cropped */}
-            <div className="flex-1 flex items-center justify-center">
-              <div className="w-[80%] h-[40%] shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] border-2 border-cyan-400 rounded-lg relative flex items-center justify-center bg-transparent backdrop-blur-none">
-                <div className="text-white/70 text-xs font-bold uppercase tracking-widest text-center px-4">
-                  Fill this box with the price tag
-                </div>
-              </div>
+            {/* Target Box: Keeps user focused on the center text row */}
+            <div className="w-[90%] h-[35%] mx-auto border-2 border-dashed border-cyan-400 rounded-2xl flex items-center justify-center bg-black/10 backdrop-blur-[1px]">
+              <span className="text-xs font-semibold tracking-wider text-cyan-300 uppercase bg-slate-950/80 px-3 py-1 rounded-md">Align Name & Price Inside</span>
             </div>
 
             <div className="pb-8">
-              <button onClick={handleCaptureAndScan} className="w-20 h-20 mx-auto bg-white rounded-full flex items-center justify-center border-4 border-slate-300 shadow-[0_0_20px_rgba(255,255,255,0.4)] active:scale-95 transition">
+              <button onClick={handleCaptureAndScan} className="w-20 h-20 mx-auto bg-white rounded-full flex items-center justify-center border-4 border-slate-300 shadow-xl active:scale-95 transition">
                 <div className="w-16 h-16 bg-cyan-500 rounded-full"></div>
               </button>
             </div>
@@ -206,57 +288,59 @@ export default function SupermarketScanner() {
       )}
 
       {appState === 'processing' && (
-        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
-          <div className="w-20 h-20 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin mb-6"></div>
-          <h2 className="text-2xl font-bold mb-2">Analyzing Tag...</h2>
-          <div className="w-full max-w-xs bg-slate-800 rounded-full h-2 mt-6">
-            <div className="bg-cyan-500 h-2 rounded-full transition-all duration-300" style={{ width: `${ocrProgress}%` }}></div>
+        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center bg-slate-950">
+          <div className="w-16 h-16 border-4 border-t-cyan-400 border-r-transparent border-b-cyan-400 border-l-transparent rounded-full animate-spin mb-6"></div>
+          <h2 className="text-xl font-bold mb-1">Processing locally...</h2>
+          <p className="text-xs text-slate-400 mb-6">Applying high-contrast threshold matrix filters</p>
+          <div className="w-64 bg-slate-800 h-1.5 rounded-full overflow-hidden">
+            <div className="bg-cyan-400 h-full transition-all duration-200" style={{ width: `${ocrProgress}%` }}></div>
           </div>
+          <span className="text-xs text-cyan-400 mt-2 font-mono">{ocrProgress}%</span>
         </div>
       )}
 
       {appState === 'teaching' && (
         <div className="flex-1 flex flex-col h-full bg-slate-900 overflow-y-auto pb-10">
           {imagePreviewUrl && (
-            <div className="w-full h-48 bg-slate-800 relative">
-               {/* eslint-disable-next-line @next/next/no-img-element */}
+            <div className="w-full h-44 bg-slate-950 relative border-b border-slate-800">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={imagePreviewUrl} alt="Captured tag" className="w-full h-full object-contain p-2" />
-              <button onClick={() => setAppState('scanning')} className="absolute top-4 left-4 w-10 h-10 rounded-full bg-black/50 flex items-center justify-center text-white">←</button>
+              <button onClick={() => setAppState('scanning')} className="absolute top-4 left-4 w-9 h-9 rounded-full bg-black/70 flex items-center justify-center text-white text-sm font-bold shadow-md">←</button>
             </div>
           )}
 
-          <form onSubmit={handleSaveToDatabase} className="flex flex-col flex-1 px-6 pt-4 space-y-5">
+          <form onSubmit={handleSaveToDatabase} className="flex flex-col flex-1 px-6 pt-5 space-y-5">
             <div>
-              <h2 className="text-xl font-bold text-white">Verify Details</h2>
+              <h2 className="text-lg font-bold text-white mb-4">Validate Scanned Data</h2>
+              
+              <label className="block text-[10px] uppercase tracking-wider font-bold text-slate-400 mb-1.5">Store Brand</label>
+              <input type="text" required value={storeName} onChange={(e) => setStoreName(e.target.value)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-cyan-400 mb-4" />
+              
+              <label className="block text-[10px] uppercase tracking-wider font-bold text-slate-400 mb-1.5">Item Name</label>
+              <input type="text" required value={productName} onChange={(e) => setProductName(e.target.value)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-cyan-400 mb-4" />
             </div>
 
             <div>
-              <label className="block text-xs uppercase font-bold text-slate-500 mb-2">Product Name (Unique)</label>
-              <input type="text" required value={productName} onChange={(e) => setProductName(e.target.value)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-cyan-400 transition" />
-            </div>
-
-            <div className="flex gap-4">
-              <div className="flex-1">
-                <label className="block text-xs uppercase font-bold text-slate-500 mb-2">Price</label>
-                <div className="relative">
-                  <span className="absolute left-4 top-3 text-slate-500 font-bold">₱</span>
-                  <input type="number" step="0.01" required value={price} onChange={(e) => setPrice(e.target.value)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl pl-8 pr-4 py-3 focus:outline-none focus:border-cyan-400 transition" />
-                </div>
+              <label className="block text-[10px] uppercase tracking-wider font-bold text-slate-400 mb-1.5">Retail Price</label>
+              <div className="relative">
+                <span className="absolute left-4 top-3 text-slate-400 font-bold text-sm">₱</span>
+                <input type="number" step="0.01" required value={price} onChange={(e) => setPrice(e.target.value)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl pl-8 pr-4 py-3 text-sm focus:outline-none focus:border-cyan-400" />
               </div>
             </div>
 
-            <button type="submit" disabled={loading} className="w-full mt-auto py-4 bg-cyan-600 hover:bg-cyan-500 rounded-xl font-bold text-white shadow-lg disabled:opacity-50">
-              {loading ? 'Saving to Database...' : 'Upload & Save Data'}
+            <button type="submit" disabled={loading} className="w-full mt-auto py-3.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-700 rounded-xl font-bold text-sm text-white shadow-lg transition duration-150">
+              {loading ? 'Uploading Data & Coordinates...' : 'Save to Supabase'}
             </button>
           </form>
         </div>
       )}
 
       {appState === 'success' && (
-        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
-          <div className="w-24 h-24 bg-emerald-500/20 text-emerald-400 rounded-full flex items-center justify-center text-4xl mb-6">✓</div>
-          <h3 className="text-2xl font-bold text-white mb-2">Item Logged!</h3>
-          <button onClick={() => setAppState('scanning')} className="w-full max-w-xs py-4 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-white mt-10">Scan Next Item</button>
+        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center bg-slate-950">
+          <div className="w-16 h-16 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded-full flex items-center justify-center text-2xl mb-4 animate-bounce">✓</div>
+          <h3 className="text-xl font-bold text-white mb-1">Item Logged Successfully</h3>
+          <p className="text-slate-400 text-xs max-w-xs mx-auto mb-10">Image sizes minimized, and active GPS coordinates saved to database columns.</p>
+          <button onClick={() => setAppState('scanning')} className="w-full max-w-xs py-3.5 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-sm text-white transition">Scan Next Item</button>
         </div>
       )}
     </main>
