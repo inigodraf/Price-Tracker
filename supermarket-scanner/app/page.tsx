@@ -9,12 +9,12 @@ const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 interface BoundingBox {
-  x: number; y: number; w: number; h: number;
+  x: number; y: number; w: number; h: number; r: number; // Added 'r' for Rotation degrees
 }
 
 type DragAction = {
   type: 'move' | 'resize';
-  handle?: 'tl' | 'tr' | 'bl' | 'br';
+  handle?: 'tl' | 'tr' | 'bl' | 'br' | 'rotate';
   target: 'name' | 'price';
   startX: number; startY: number;
   startBox: BoundingBox;
@@ -31,8 +31,9 @@ export default function SupermarketScanner() {
   const fullCanvasRef = useRef<HTMLCanvasElement>(null);
   const cropCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [nameBox, setNameBox] = useState<BoundingBox>({ x: 10, y: 25, w: 80, h: 14 });
-  const [priceBox, setPriceBox] = useState<BoundingBox>({ x: 20, y: 52, w: 60, h: 14 });
+  // Added r: 0 to the default box states
+  const [nameBox, setNameBox] = useState<BoundingBox>({ x: 10, y: 25, w: 80, h: 12, r: 0 });
+  const [priceBox, setPriceBox] = useState<BoundingBox>({ x: 20, y: 52, w: 60, h: 12, r: 0 });
   
   const dragAction = useRef<DragAction | null>(null);
 
@@ -85,7 +86,6 @@ export default function SupermarketScanner() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Capture at extremely high resolution for better OCR baseline
     canvas.width = 1440;
     canvas.height = (video.videoHeight / video.videoWidth) * 1440;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -99,7 +99,7 @@ export default function SupermarketScanner() {
     }, 'image/jpeg', 0.9);
   };
 
-  const handlePointerDown = (e: React.PointerEvent, type: 'move' | 'resize', handle?: 'tl' | 'tr' | 'bl' | 'br') => {
+  const handlePointerDown = (e: React.PointerEvent, type: 'move' | 'resize', handle?: 'tl' | 'tr' | 'bl' | 'br' | 'rotate') => {
     e.stopPropagation();
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
 
@@ -124,36 +124,49 @@ export default function SupermarketScanner() {
 
     let updated = { ...action.startBox };
 
+    // Handle standard move
     if (action.type === 'move') {
       updated.x = Math.max(0, Math.min(100 - updated.w, action.startBox.x + deltaX));
       updated.y = Math.max(0, Math.min(100 - updated.h, action.startBox.y + deltaY));
-    } else if (action.type === 'resize' && action.handle) {
-      const minSize = 6; // Allow tighter boxes for very small price text
+    } 
+    // Handle free-form rotation math
+    else if (action.handle === 'rotate') {
+      const cx = rect.left + (action.startBox.x + action.startBox.w / 2) / 100 * rect.width;
+      const cy = rect.top + (action.startBox.y + action.startBox.h / 2) / 100 * rect.height;
+      const dx = e.clientX - cx;
+      const dy = e.clientY - cy;
+      const angle = Math.atan2(dy, dx) * (180 / Math.PI) + 90;
+      updated.r = angle;
+    } 
+    // Handle resizes
+    else if (action.type === 'resize' && action.handle) {
+      const minSizeX = 4;
+      const minSizeY = 2; // Allowed height to go down to 2% for incredibly tiny text
       
       switch (action.handle) {
         case 'tl':
-          const newX = Math.min(action.startBox.x + action.startBox.w - minSize, Math.max(0, action.startBox.x + deltaX));
+          const newX = Math.min(action.startBox.x + action.startBox.w - minSizeX, Math.max(0, action.startBox.x + deltaX));
           updated.w = action.startBox.x + action.startBox.w - newX;
           updated.x = newX;
-          const newY = Math.min(action.startBox.y + action.startBox.h - minSize, Math.max(0, action.startBox.y + deltaY));
+          const newY = Math.min(action.startBox.y + action.startBox.h - minSizeY, Math.max(0, action.startBox.y + deltaY));
           updated.h = action.startBox.y + action.startBox.h - newY;
           updated.y = newY;
           break;
         case 'tr':
-          updated.w = Math.max(minSize, Math.min(100 - action.startBox.x, action.startBox.w + deltaX));
-          const newY_tr = Math.min(action.startBox.y + action.startBox.h - minSize, Math.max(0, action.startBox.y + deltaY));
+          updated.w = Math.max(minSizeX, Math.min(100 - action.startBox.x, action.startBox.w + deltaX));
+          const newY_tr = Math.min(action.startBox.y + action.startBox.h - minSizeY, Math.max(0, action.startBox.y + deltaY));
           updated.h = action.startBox.y + action.startBox.h - newY_tr;
           updated.y = newY_tr;
           break;
         case 'bl':
-          const newX_bl = Math.min(action.startBox.x + action.startBox.w - minSize, Math.max(0, action.startBox.x + deltaX));
+          const newX_bl = Math.min(action.startBox.x + action.startBox.w - minSizeX, Math.max(0, action.startBox.x + deltaX));
           updated.w = action.startBox.x + action.startBox.w - newX_bl;
           updated.x = newX_bl;
-          updated.h = Math.max(minSize, Math.min(100 - action.startBox.y, action.startBox.h + deltaY));
+          updated.h = Math.max(minSizeY, Math.min(100 - action.startBox.y, action.startBox.h + deltaY));
           break;
         case 'br':
-          updated.w = Math.max(minSize, Math.min(100 - action.startBox.x, action.startBox.w + deltaX));
-          updated.h = Math.max(minSize, Math.min(100 - action.startBox.y, action.startBox.h + deltaY));
+          updated.w = Math.max(minSizeX, Math.min(100 - action.startBox.x, action.startBox.w + deltaX));
+          updated.h = Math.max(minSizeY, Math.min(100 - action.startBox.y, action.startBox.h + deltaY));
           break;
       }
     }
@@ -168,68 +181,79 @@ export default function SupermarketScanner() {
     dragAction.current = null;
   };
 
-  // --- OPTIMIZED AI IMAGE PIPELINE ---
-  const scanCroppedZone = async (box: BoundingBox, isPrice: boolean): Promise<string> => {
+  // --- NATIVE CANVAS ROTATION & EXTRACTION ---
+  const extractImage = (box: BoundingBox): string => {
     if (!fullCanvasRef.current || !cropCanvasRef.current) return "";
     const fullCanvas = fullCanvasRef.current;
     const cropCanvas = cropCanvasRef.current;
     const cropCtx = cropCanvas.getContext('2d');
     if (!cropCtx) return "";
 
-    const sx = (box.x / 100) * fullCanvas.width;
-    const sy = (box.y / 100) * fullCanvas.height;
     const sw = (box.w / 100) * fullCanvas.width;
     const sh = (box.h / 100) * fullCanvas.height;
 
-    // AI SCALING TRICK: Multiply size by 2.5x so the neural network can read tiny pixels
-    const scaleFactor = 2.5;
+    // Magnify for AI precision
+    const scaleFactor = 3.0; 
     cropCanvas.width = sw * scaleFactor;
     cropCanvas.height = sh * scaleFactor;
-    
-    // Disable smoothing to prevent blurring when scaling pixelated text up
-    cropCtx.imageSmoothingEnabled = false; 
-    cropCtx.drawImage(fullCanvas, sx, sy, sw, sh, 0, 0, cropCanvas.width, cropCanvas.height);
 
-    // Apply a smooth Grayscale & Contrast boost (instead of destroying edges with pure B&W)
-    const imgData = cropCtx.getImageData(0, 0, cropCanvas.width, cropCanvas.height);
-    const d = imgData.data;
-    for (let i = 0; i < d.length; i += 4) {
-      const r = d[i], g = d[i+1], b = d[i+2];
-      // Convert to Grayscale
-      let gray = 0.299 * r + 0.587 * g + 0.114 * b;
-      // Boost contrast heavily but keep gradients
-      gray = ((gray / 255 - 0.5) * 1.5 + 0.5) * 255;
-      gray = Math.max(0, Math.min(255, gray)); // Clamp
-      d[i] = d[i+1] = d[i+2] = gray;
-    }
-    cropCtx.putImageData(imgData, 0, 0);
+    // Fill white background to prevent transparent voids from rotation
+    cropCtx.fillStyle = 'white';
+    cropCtx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
 
-    return new Promise((resolve) => {
-      Tesseract.recognize(cropCanvas.toDataURL('image/jpeg'), 'eng')
-        .then(res => resolve(res.data.text))
-        .catch(() => resolve(""));
-    });
+    // High quality context filters instead of manual pixel destruction
+    cropCtx.filter = 'grayscale(100%) contrast(160%) brightness(110%)';
+
+    // Matrix geometry to flatten rotated boxes cleanly
+    cropCtx.scale(scaleFactor, scaleFactor);
+    cropCtx.translate(sw / 2, sh / 2);
+    cropCtx.rotate((box.r * Math.PI) / 180);
+
+    const cx = (box.x + box.w / 2) / 100 * fullCanvas.width;
+    const cy = (box.y + box.h / 2) / 100 * fullCanvas.height;
+
+    cropCtx.drawImage(fullCanvas, -cx, -cy);
+    cropCtx.filter = 'none';
+
+    return cropCanvas.toDataURL('image/jpeg');
   };
 
+  // --- OCR V5 WORKER EXECUTION ---
   const handleExecuteOcrScan = async () => {
     setAppState('processing');
-    setOcrProgress(30);
+    setOcrProgress(10);
     
     try {
-      const [rawNameText, rawPriceText] = await Promise.all([
-        scanCroppedZone(nameBox, false),
-        scanCroppedZone(priceBox, true)
-      ]);
+      const nameDataUrl = extractImage(nameBox);
+      const priceDataUrl = extractImage(priceBox);
+      setOcrProgress(25);
 
+      // We instantiate the worker manually so we can force Single Line Mode
+      const worker = await Tesseract.createWorker('eng');
+      
+      // PSM 7 tells the AI "This is a single line of text". It stops hallucinating nonsense.
+      await worker.setParameters({
+        tessedit_pageseg_mode: '7',
+      });
+      setOcrProgress(50);
+
+      const { data: { text: rawNameText } } = await worker.recognize(nameDataUrl);
       setOcrProgress(75);
 
+      const { data: { text: rawPriceText } } = await worker.recognize(priceDataUrl);
+      await worker.terminate();
+      setOcrProgress(90);
+
+      // Less aggressive Regex: Allows hyphens, dots, commas, slashes, percent signs, and ampersands
       const cleanName = rawNameText
-        .replace(/[^a-zA-Z0-9\s\-\.]/g, '')
+        .replace(/[^a-zA-Z0-9\s\-\.,&'%\/\+]/g, '')
         .replace(/\s+/g, ' ')
         .trim()
         .toUpperCase(); 
       
-      let cleanPrice = rawPriceText.replace(/[^0-9\.]/g, '').trim();
+      // Keep numbers, dots, and commas for the price
+      let cleanPrice = rawPriceText.replace(/[^0-9\.,]/g, '').trim();
+      cleanPrice = cleanPrice.replace(/,/g, '.'); // Normalize commas to dots
       
       if (cleanPrice && !cleanPrice.includes('.')) {
         if (cleanPrice.length > 2) {
@@ -311,20 +335,17 @@ export default function SupermarketScanner() {
             className="flex-1 relative w-full bg-contain bg-center bg-no-repeat overflow-hidden touch-none"
             style={{ backgroundImage: `url(${imagePreviewUrl})` }}
           >
-            {/* FOCUS MASK EFFECT: This creates the beautiful native darkening around the active selection */}
-            
             {/* ITEM NAME FRAME */}
             <div 
               onPointerDown={(e) => { setActiveBoxMode('name'); handlePointerDown(e, 'move'); }}
               onPointerUp={handlePointerUp}
-              className={`absolute border-[3px] rounded shadow-sm cursor-move touch-none transition-all duration-200 ${
-                activeBoxMode === 'name' ? 'border-cyan-400 z-30' : 'border-white/30 bg-black/20 opacity-40 z-10'
+              className={`absolute border-[3px] rounded shadow-sm cursor-move touch-none transition-colors duration-200 ${
+                activeBoxMode === 'name' ? 'border-cyan-400 z-30 bg-cyan-500/10' : 'border-white/30 bg-black/20 opacity-40 z-10'
               }`}
               style={{ 
                 left: `${nameBox.x}%`, top: `${nameBox.y}%`, width: `${nameBox.w}%`, height: `${nameBox.h}%`,
-                // Cinematic Mask Hack: Giant box shadow that covers the whole screen when active
-                boxShadow: activeBoxMode === 'name' ? '0 0 0 9999px rgba(0, 0, 0, 0.6)' : 'none',
-                background: activeBoxMode === 'name' ? 'transparent' : ''
+                transform: `rotate(${nameBox.r}deg)`,
+                boxShadow: activeBoxMode === 'name' ? '0 0 40px rgba(0, 0, 0, 0.8)' : 'none'
               }}
             >
               <div className={`absolute -top-[22px] left-[-3px] text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-t ${activeBoxMode === 'name' ? 'bg-cyan-400 text-slate-950' : 'bg-slate-700/80 text-white'}`}>
@@ -333,6 +354,13 @@ export default function SupermarketScanner() {
 
               {activeBoxMode === 'name' && (
                 <>
+                  {/* The new Rotation Handle (Stick + Ball) */}
+                  <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'rotate')} onPointerUp={handlePointerUp} className="absolute -top-12 left-1/2 -translate-x-1/2 w-10 h-10 flex items-center justify-center cursor-grab touch-none">
+                    <div className="w-[3px] h-6 bg-cyan-400 absolute bottom-2 rounded-full"></div>
+                    <div className="w-5 h-5 bg-cyan-400 rounded-full shadow-lg border-[3px] border-slate-900 absolute top-0"></div>
+                  </div>
+
+                  {/* Corner Resizers */}
                   <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'tl')} onPointerUp={handlePointerUp} className="absolute -top-3 -left-3 w-8 h-8 flex items-start justify-start cursor-nwse-resize touch-none"><div className="w-4 h-4 bg-cyan-400 rounded-full shadow-md" /></div>
                   <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'tr')} onPointerUp={handlePointerUp} className="absolute -top-3 -right-3 w-8 h-8 flex items-start justify-end cursor-nesw-resize touch-none"><div className="w-4 h-4 bg-cyan-400 rounded-full shadow-md" /></div>
                   <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'bl')} onPointerUp={handlePointerUp} className="absolute -bottom-3 -left-3 w-8 h-8 flex items-end justify-start cursor-nesw-resize touch-none"><div className="w-4 h-4 bg-cyan-400 rounded-full shadow-md" /></div>
@@ -345,13 +373,13 @@ export default function SupermarketScanner() {
             <div 
               onPointerDown={(e) => { setActiveBoxMode('price'); handlePointerDown(e, 'move'); }}
               onPointerUp={handlePointerUp}
-              className={`absolute border-[3px] rounded shadow-sm cursor-move touch-none transition-all duration-200 ${
-                activeBoxMode === 'price' ? 'border-emerald-400 z-30' : 'border-white/30 bg-black/20 opacity-40 z-10'
+              className={`absolute border-[3px] rounded shadow-sm cursor-move touch-none transition-colors duration-200 ${
+                activeBoxMode === 'price' ? 'border-emerald-400 z-30 bg-emerald-500/10' : 'border-white/30 bg-black/20 opacity-40 z-10'
               }`}
               style={{ 
                 left: `${priceBox.x}%`, top: `${priceBox.y}%`, width: `${priceBox.w}%`, height: `${priceBox.h}%`,
-                boxShadow: activeBoxMode === 'price' ? '0 0 0 9999px rgba(0, 0, 0, 0.6)' : 'none',
-                background: activeBoxMode === 'price' ? 'transparent' : ''
+                transform: `rotate(${priceBox.r}deg)`,
+                boxShadow: activeBoxMode === 'price' ? '0 0 40px rgba(0, 0, 0, 0.8)' : 'none'
               }}
             >
               <div className={`absolute -top-[22px] left-[-3px] text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-t ${activeBoxMode === 'price' ? 'bg-emerald-400 text-slate-950' : 'bg-slate-700/80 text-white'}`}>
@@ -360,6 +388,11 @@ export default function SupermarketScanner() {
 
               {activeBoxMode === 'price' && (
                 <>
+                  <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'rotate')} onPointerUp={handlePointerUp} className="absolute -top-12 left-1/2 -translate-x-1/2 w-10 h-10 flex items-center justify-center cursor-grab touch-none">
+                    <div className="w-[3px] h-6 bg-emerald-400 absolute bottom-2 rounded-full"></div>
+                    <div className="w-5 h-5 bg-emerald-400 rounded-full shadow-lg border-[3px] border-slate-900 absolute top-0"></div>
+                  </div>
+
                   <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'tl')} onPointerUp={handlePointerUp} className="absolute -top-3 -left-3 w-8 h-8 flex items-start justify-start cursor-nwse-resize touch-none"><div className="w-4 h-4 bg-emerald-400 rounded-full shadow-md" /></div>
                   <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'tr')} onPointerUp={handlePointerUp} className="absolute -top-3 -right-3 w-8 h-8 flex items-start justify-end cursor-nesw-resize touch-none"><div className="w-4 h-4 bg-emerald-400 rounded-full shadow-md" /></div>
                   <div onPointerDown={(e) => handlePointerDown(e, 'resize', 'bl')} onPointerUp={handlePointerUp} className="absolute -bottom-3 -left-3 w-8 h-8 flex items-end justify-start cursor-nesw-resize touch-none"><div className="w-4 h-4 bg-emerald-400 rounded-full shadow-md" /></div>
