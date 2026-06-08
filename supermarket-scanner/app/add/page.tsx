@@ -20,6 +20,58 @@ function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
   return R * c;
 }
 
+// --------------------------------------------------------
+// NEW: NATIVE IMAGE COMPRESSOR (Reduces 5MB images to ~100kb)
+// --------------------------------------------------------
+const compressImage = async (file: File, maxWidth = 800, quality = 0.7): Promise<File> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+
+        // Resize if larger than maxWidth
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          canvas.toBlob(
+            (blob) => {
+              if (blob) {
+                // Force convert to lightweight JPEG
+                const newFile = new File([blob], file.name.replace(/\.[^/.]+$/, ".jpg"), {
+                  type: 'image/jpeg',
+                  lastModified: Date.now(),
+                });
+                resolve(newFile);
+              } else {
+                reject(new Error("Canvas compression failed"));
+              }
+            },
+            'image/jpeg',
+            quality // 0.7 = 70% quality, perfect balance for web
+          );
+        } else {
+          reject(new Error("No canvas context"));
+        }
+      };
+      img.onerror = (error) => reject(error);
+    };
+    reader.onerror = (error) => reject(error);
+  });
+};
+
 interface Market { id: string; name: string; latitude: number; longitude: number; distance?: number; }
 
 const PH_CATEGORIES = [
@@ -60,7 +112,6 @@ function AddItemContent() {
   const [imagePreview, setImagePreview] = useState<string | null>(null);
 
   useEffect(() => {
-    // If they came from a specific store link, bypass GPS entirely!
     const urlStore = searchParams.get('store');
     const urlLat = searchParams.get('lat');
     const urlLng = searchParams.get('lng');
@@ -80,7 +131,6 @@ function AddItemContent() {
       const { data } = await supabase.from('markets').select('*');
       let fetchedMarkets: Market[] = data || [];
 
-      // Calculate distance for all markets and sort them
       fetchedMarkets = fetchedMarkets.map(m => ({
         ...m,
         distance: getDistance(userLat, userLng, m.latitude, m.longitude)
@@ -90,7 +140,6 @@ function AddItemContent() {
       setStep(2);
     };
 
-    // Strict GPS Enforcement
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (position) => {
@@ -100,13 +149,13 @@ function AddItemContent() {
         (error) => {
           console.warn("GPS disabled or denied");
           alert("Location access is required to add an item. Please enable GPS permissions.");
-          router.push('/'); // Kick back to home
+          router.push('/');
         },
         { enableHighAccuracy: true, timeout: 7000, maximumAge: 0 }
       );
     } else {
       alert("Location services are not supported by your device.");
-      router.push('/'); // Kick back to home
+      router.push('/');
     }
   }, [searchParams, router]);
 
@@ -166,13 +215,19 @@ function AddItemContent() {
 
     try {
       if (imageFile) {
-        const fileExt = imageFile.name.split('.').pop();
-        const fileName = `${Date.now()}-${Math.random().toString(36).substring(2)}.${fileExt}`;
-        const { error: uploadError } = await supabase.storage.from('product_images').upload(fileName, imageFile);
+        // COMPRESS THE IMAGE FIRST
+        const compressedFile = await compressImage(imageFile);
+        
+        const fileName = `${Date.now()}-${Math.random().toString(36).substring(2)}.jpg`;
+        
+        // FIXED BUCKET NAME TO "product-images"
+        const { error: uploadError } = await supabase.storage.from('product-images').upload(fileName, compressedFile);
         
         if (!uploadError) {
-          const { data } = supabase.storage.from('product_images').getPublicUrl(fileName);
+          const { data } = supabase.storage.from('product-images').getPublicUrl(fileName);
           imageUrl = data.publicUrl;
+        } else {
+          console.error("Upload error:", uploadError);
         }
       }
 
