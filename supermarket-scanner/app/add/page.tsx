@@ -20,9 +20,6 @@ function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
   return R * c;
 }
 
-// --------------------------------------------------------
-// NEW: NATIVE IMAGE COMPRESSOR (Reduces 5MB images to ~100kb)
-// --------------------------------------------------------
 const compressImage = async (file: File, maxWidth = 800, quality = 0.7): Promise<File> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -35,7 +32,6 @@ const compressImage = async (file: File, maxWidth = 800, quality = 0.7): Promise
         let width = img.width;
         let height = img.height;
 
-        // Resize if larger than maxWidth
         if (width > maxWidth) {
           height = Math.round((height * maxWidth) / width);
           width = maxWidth;
@@ -49,7 +45,6 @@ const compressImage = async (file: File, maxWidth = 800, quality = 0.7): Promise
           canvas.toBlob(
             (blob) => {
               if (blob) {
-                // Force convert to lightweight JPEG
                 const newFile = new File([blob], file.name.replace(/\.[^/.]+$/, ".jpg"), {
                   type: 'image/jpeg',
                   lastModified: Date.now(),
@@ -60,7 +55,7 @@ const compressImage = async (file: File, maxWidth = 800, quality = 0.7): Promise
               }
             },
             'image/jpeg',
-            quality // 0.7 = 70% quality, perfect balance for web
+            quality
           );
         } else {
           reject(new Error("No canvas context"));
@@ -106,10 +101,15 @@ function AddItemContent() {
   const [similarMarkets, setSimilarMarkets] = useState<Market[] | null>(null);
 
   const [productName, setProductName] = useState("");
+  const [stallName, setStallName] = useState(""); // <-- NEW: Stall Name State
   const [price, setPrice] = useState("");
   const [category, setCategory] = useState("");
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
+
+  // Confirmation Overwrite UI States
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [existingItemData, setExistingItemData] = useState<{ id: string; price: number } | null>(null);
 
   useEffect(() => {
     const urlStore = searchParams.get('store');
@@ -206,46 +206,77 @@ function AddItemContent() {
     }
   };
 
-  const handleSubmitProduct = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Main save function handles both verification checking, inserting, and explicit updates
+  const handleSubmitProduct = async (e?: React.FormEvent, forceUpdateId?: string) => {
+    if (e) e.preventDefault();
     if (!productName || !price || !category || !selectedMarket) return;
     
     setIsSubmitting(true);
+    const finalProductName = productName.trim().toUpperCase();
+    const finalStallName = stallName.trim().toUpperCase() || "MAIN"; // Defaults to "MAIN" if blank
+    const parsedPrice = parseFloat(price);
+
+    // Check for duplication rule if we aren't bypassing via the modal trigger
+    if (!forceUpdateId) {
+      const { data: duplicateCheck, error: checkError } = await supabase
+        .from('supermarket_items')
+        .select('id, price')
+        .eq('store_name', selectedMarket.name)
+        .eq('stall_name', finalStallName)
+        .eq('product_name', finalProductName);
+
+      if (checkError) {
+        console.error("Error checking for duplicates:", checkError);
+      }
+
+      if (duplicateCheck && duplicateCheck.length > 0) {
+        // Match found! Interrupt flow and request user confirmation.
+        setExistingItemData({ id: duplicateCheck[0].id, price: duplicateCheck[0].price });
+        setIsSubmitting(false);
+        setShowConfirmModal(true);
+        return;
+      }
+    }
+
     let imageUrl = "";
 
     try {
       if (imageFile) {
-        // COMPRESS THE IMAGE FIRST
         const compressedFile = await compressImage(imageFile);
-        
         const fileName = `${Date.now()}-${Math.random().toString(36).substring(2)}.jpg`;
-        
-        // FIXED BUCKET NAME TO "product-images"
         const { error: uploadError } = await supabase.storage.from('product-images').upload(fileName, compressedFile);
         
         if (!uploadError) {
           const { data } = supabase.storage.from('product-images').getPublicUrl(fileName);
           imageUrl = data.publicUrl;
-        } else {
-          console.error("Upload error:", uploadError);
         }
       }
 
-      const { error: dbError } = await supabase.from('supermarket_items').insert([{
-        product_name: productName.trim(),
-        price: parseFloat(price),
-        category: category,
-        store_name: selectedMarket.name,
-        latitude: selectedMarket.latitude,
-        longitude: selectedMarket.longitude,
-        image_url: imageUrl
-      }]);
+      if (forceUpdateId) {
+        // UPDATE EXISTING ITEM PRICE
+        const updatePayload: any = { price: parsedPrice, category: category };
+        if (imageUrl) updatePayload.image_url = imageUrl;
 
-      if (dbError) {
-        console.error("Database Insert Error:", dbError);
-        alert(`Database error: ${dbError.message}`);
-        setIsSubmitting(false);
-        return;
+        const { error: dbError } = await supabase
+          .from('supermarket_items')
+          .update(updatePayload)
+          .eq('id', forceUpdateId);
+
+        if (dbError) throw dbError;
+      } else {
+        // INSERT BRAND NEW RECORD
+        const { error: dbError } = await supabase.from('supermarket_items').insert([{
+          product_name: finalProductName,
+          stall_name: finalStallName,
+          price: parsedPrice,
+          category: category,
+          store_name: selectedMarket.name,
+          latitude: selectedMarket.latitude,
+          longitude: selectedMarket.longitude,
+          image_url: imageUrl
+        }]);
+
+        if (dbError) throw dbError;
       }
       
       router.push('/');
@@ -347,7 +378,7 @@ function AddItemContent() {
         )}
 
         {step === 3 && selectedMarket && (
-          <form onSubmit={handleSubmitProduct} className="space-y-6 pb-20 animate-in slide-in-from-right-8">
+          <form onSubmit={(e) => handleSubmitProduct(e)} className="space-y-6 pb-20 animate-in slide-in-from-right-8">
             <div className="bg-emerald-500/10 border border-emerald-500/30 p-4 rounded-2xl flex items-center justify-between">
               <div>
                 <p className="text-xs text-emerald-400 font-bold uppercase tracking-wider">Active Location</p>
@@ -377,6 +408,15 @@ function AddItemContent() {
               <div className="space-y-2">
                 <label className="text-sm font-bold text-slate-300">Product Name</label>
                 <input type="text" value={productName} onChange={(e) => setProductName(e.target.value.toUpperCase())} placeholder="PRODUCT NAME" className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-white uppercase focus:outline-none focus:border-emerald-500" required />
+              </div>
+
+              {/* NEW: Optional Stall Name Input Field */}
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <label className="text-sm font-bold text-slate-300">Stall Name</label>
+                  <span className="text-[10px] text-slate-500 uppercase font-black tracking-wider">Optional</span>
+                </div>
+                <input type="text" value={stallName} onChange={(e) => setStallName(e.target.value.toUpperCase())} placeholder="E.G. STALL #4, WET MARKET ROW B" className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-white uppercase focus:outline-none focus:border-emerald-500 text-sm" />
               </div>
 
               <div className="space-y-2">
@@ -414,6 +454,42 @@ function AddItemContent() {
           </form>
         )}
       </div>
+
+      {/* NEW: Dynamic Overwrite / Duplicate Price Confirmation Dialog Overlay */}
+      {showConfirmModal && existingItemData && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-6 z-[100] animate-in fade-in">
+          <div className="bg-slate-900 border border-slate-800 max-w-sm w-full rounded-2xl p-6 shadow-2xl space-y-4 animate-in zoom-in-95">
+            <div className="w-12 h-12 rounded-full bg-amber-500/10 text-amber-400 flex items-center justify-center mx-auto">
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+            </div>
+            <div className="text-center space-y-2">
+              <h3 className="font-black text-lg text-white">Item Already Exists</h3>
+              <p className="text-slate-400 text-sm leading-relaxed">
+                <span className="text-emerald-400 font-bold">{productName.trim().toUpperCase()}</span> is already registered in this stall.
+              </p>
+              <div className="bg-slate-950 rounded-xl p-3 my-2 border border-slate-800 grid grid-cols-2 text-center text-xs divide-x divide-slate-800">
+                <div>
+                  <p className="text-slate-500 uppercase font-bold tracking-tight">Current Price</p>
+                  <p className="text-slate-300 font-mono text-base font-bold">PHP {existingItemData.price.toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-amber-400 uppercase font-bold tracking-tight">New Price</p>
+                  <p className="text-white font-mono text-base font-bold">PHP {parseFloat(price).toFixed(2)}</p>
+                </div>
+              </div>
+              <p className="text-xs text-slate-500 italic">Do you want to update the existing item to match this new price?</p>
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button onClick={() => { setShowConfirmModal(false); setExistingItemData(null); }} className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-3 rounded-xl transition text-sm">
+                Cancel
+              </button>
+              <button onClick={() => { setShowConfirmModal(false); handleSubmitProduct(undefined, existingItemData.id); }} className="flex-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black py-3 rounded-xl transition text-sm shadow-md shadow-amber-500/10">
+                Update Price
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
